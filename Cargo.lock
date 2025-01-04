@@ -699,6 +699,7 @@ dependencies = [
  "rand",
  "rayon",
  "realfft",
+ "regex",
  "serde",
  "serde_json",
  "tar",

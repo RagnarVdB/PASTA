@@ -22,7 +22,7 @@ use cubic::{calculate_interpolation_coefficients, calculate_interpolation_coeffi
 use enum_dispatch::enum_dispatch;
 use fitting::{
     BestParticleObserver, BinaryFitter, BinaryRVFitter, BinaryTimeriesKnownRVFitter, DummyObserver,
-    ObservedSpectrum, Observer, PSOobserver, SingleFitter,
+    ObservedSpectrum, Observer, PSOobserver, ParticleInfo, SingleFitter,
 };
 use indicatif::ProgressBar;
 use interpolate::{FluxFloat, GridInterpolator, Interpolator};
@@ -36,7 +36,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyDict, PyFloat, PyInt, PyList};
 use pyo3::{prelude::*, pyclass};
 use rayon::prelude::*;
+use regex::Regex;
 use serde::Serialize;
+use std::fs::{read_dir, File};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 /// Parameters to the PSO algorithm
@@ -697,7 +700,7 @@ impl PyWavelengthDispersion {
         input_wavelength: WlGrid,
     ) {
         let out_dir = Path::new(output_directory.as_str());
-        let files: Vec<PathBuf> = std::fs::read_dir(input_directory)
+        let files: Vec<PathBuf> = read_dir(input_directory)
             .unwrap()
             .map(|x| x.unwrap().path())
             .collect();
@@ -707,9 +710,7 @@ impl PyWavelengthDispersion {
             if out_file.exists() {
                 return;
             }
-            let arr: na::DVector<u16> = read_npy_file(std::fs::File::open(file).unwrap())
-                .unwrap()
-                .into();
+            let arr: na::DVector<u16> = read_npy_file(File::open(file).unwrap()).unwrap().into();
             if includes_factor {
                 let bytes1 = arr[0].to_le_bytes();
                 let bytes2 = arr[1].to_le_bytes();
@@ -834,19 +835,60 @@ fn RangeConstraint(parameter: usize, lower: f64, upper: f64) -> PyConstraintWrap
     })
 }
 
-fn get_observer<const N: usize>(
+fn get_observer_and_init<const N: usize>(
     trace_directory: Option<String>,
     best_particle_file: Option<String>,
-) -> Box<dyn Observer<N>> {
-    match (trace_directory, best_particle_file) {
-        (Some(trace_directory), None) => Box::new(PSOobserver::new(&trace_directory, "it")),
-        (None, Some(best_particle_file)) => {
-            Box::new(BestParticleObserver::new(best_particle_file.into()))
+    resume: bool,
+) -> (Box<dyn Observer<N>>, Option<Vec<na::SVector<f64, N>>>) {
+    match (trace_directory, best_particle_file, resume) {
+        (Some(trace_directory), None, false) => {
+            (Box::new(PSOobserver::new(&trace_directory, "it", 0)), None)
         }
-        (Some(_), Some(_)) => {
+        (Some(trace_directory), None, true) => {
+            let paths = read_dir(&trace_directory).unwrap();
+            let path_strings = paths
+                .into_iter()
+                .map(|path| path.unwrap().file_name().to_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            let re = Regex::new(r"_(\d+)\.json").unwrap();
+            let iterations = path_strings
+                .iter()
+                .map(|path| {
+                    re.captures(path)
+                        .unwrap()
+                        .get(1)
+                        .unwrap()
+                        .as_str()
+                        .parse::<usize>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let (i, _) = iterations
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, &value)| value)
+                .unwrap();
+            let file = File::open(Path::new(&trace_directory).join(&path_strings[i])).unwrap();
+            let reader = BufReader::new(file);
+            let particles: Vec<ParticleInfo> = serde_json::from_reader(reader).unwrap();
+            let positions = particles
+                .into_iter()
+                .map(|p| na::SVector::<f64, N>::from_vec(p.position))
+                .collect::<Vec<_>>();
+            (
+                Box::new(PSOobserver::new(&trace_directory, "it", iterations[i] + 1)),
+                Some(positions),
+            )
+        }
+        (None, Some(best_particle_file), false) => (
+            Box::new(BestParticleObserver::new(best_particle_file.into())),
+            None,
+        ),
+        (None, Some(_), true) => panic!("Cannot resumed from best particle info"),
+        (Some(_), Some(_), _) => {
             panic!("Cannot specify both trace_directory and best_particle_file")
         }
-        _ => Box::new(DummyObserver()),
+        _ => (Box::new(DummyObserver()), None),
     }
 }
 
@@ -1499,7 +1541,7 @@ macro_rules! implement_methods {
                 let result = self.0.fit(
                     &interpolator.0,
                     &observed_spectrum.into(),
-                    get_observer(trace_directory, best_particle_file),
+                    get_observer_and_init(trace_directory, best_particle_file, false).0,
                     parallelize.unwrap_or(true),
                     constraints,
                 )?;
@@ -1644,6 +1686,7 @@ macro_rules! implement_methods {
                 best_particle_file: Option<String>,
                 parallelize: Option<bool>,
                 constraints: Option<Vec<PyConstraintWrapper>>,
+                resume: Option<bool>,
             ) -> PyResult<BinaryOptimizationResult> {
                 let observed_spectrum = ObservedSpectrum {
                     flux: observed_flux.as_matrix().column(0).into_owned(),
@@ -1656,13 +1699,19 @@ macro_rules! implement_methods {
                         .collect(),
                     None => vec![],
                 };
+                let (observer, initial_positions) = get_observer_and_init(
+                    trace_directory,
+                    best_particle_file,
+                    resume.unwrap_or(false),
+                );
                 let result = self.0.fit(
                     &interpolator.0,
                     &continuum_interpolator.0,
                     &observed_spectrum.into(),
-                    get_observer(trace_directory, best_particle_file),
+                    observer,
                     parallelize.unwrap_or(true),
                     constraints,
+                    initial_positions,
                 );
                 Ok(result?.into())
             }
@@ -1731,7 +1780,7 @@ macro_rules! implement_methods {
                     &continuum2.into(),
                     light_ratio,
                     &observed_spectrum,
-                    get_observer(trace_directory, best_particle_file),
+                    get_observer_and_init(trace_directory, best_particle_file, false).0,
                     constraints,
                 );
                 Ok(result?.into())
@@ -1814,7 +1863,7 @@ macro_rules! implement_methods {
                     &continuum_interpolator.0,
                     &observed_spectra,
                     &rvs,
-                    get_observer(trace_directory, best_particle_file),
+                    get_observer_and_init(trace_directory, best_particle_file, false).0,
                     parallelize.unwrap_or(true),
                     constraints,
                 );

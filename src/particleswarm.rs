@@ -47,6 +47,8 @@ pub struct ParticleSwarm<const N: usize, B: PSOBounds<N>, F> {
     num_particles: usize,
     /// Random number generator
     rng_generator: rand::rngs::StdRng,
+    /// Initial positions, random if set to None
+    initial_positions: Option<Vec<na::SVector<f64, N>>>,
 }
 
 impl<const N: usize, B, F> ParticleSwarm<N, B, F>
@@ -54,7 +56,11 @@ where
     B: PSOBounds<N>,
     F: ArgminFloat,
 {
-    pub fn new(bounds: B, num_particles: usize) -> Self {
+    pub fn new(
+        bounds: B,
+        num_particles: usize,
+        initial_positions: Option<Vec<na::SVector<f64, N>>>,
+    ) -> Self {
         ParticleSwarm {
             weight_inertia: float!(1.0f64 / (2.0 * 2.0f64.ln())),
             weight_cognitive: float!(0.5 + 2.0f64.ln()),
@@ -63,6 +69,7 @@ where
             bounds,
             num_particles,
             rng_generator: rand::rngs::StdRng::from_entropy(),
+            initial_positions,
         }
     }
 }
@@ -135,18 +142,23 @@ where
 
     /// Initializes positions and velocities for all particles
     fn initialize_positions_and_velocities(&mut self) -> (Vec<V<N>>, Vec<V<N>>) {
-        let (min, max) = self.bounds.outer_limits();
-        let delta = max.sub(&min);
-        let delta_neg = -delta;
-        let positions = self
-            .bounds
-            .generate_random_within_bounds(&mut self.rng_generator, self.num_particles)
-            .into_iter()
-            .collect();
-        let velocities = (0..self.num_particles)
-            .map(|_| V::<N>::rand_from_range(&delta_neg, &delta, &mut self.rng_generator))
-            .collect();
-        (positions, velocities)
+        if let Some(positions) = &self.initial_positions {
+            let velocities = (0..self.num_particles).map(|_| V::<N>::zeros()).collect();
+            (positions.clone(), velocities)
+        } else {
+            let (min, max) = self.bounds.outer_limits();
+            let delta = max.sub(&min);
+            let delta_neg = -delta;
+            let positions = self
+                .bounds
+                .generate_random_within_bounds(&mut self.rng_generator, self.num_particles)
+                .into_iter()
+                .collect();
+            let velocities = (0..self.num_particles)
+                .map(|_| V::<N>::rand_from_range(&delta_neg, &delta, &mut self.rng_generator))
+                .collect();
+            (positions, velocities)
+        }
     }
 }
 

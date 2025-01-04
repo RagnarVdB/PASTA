@@ -3,7 +3,8 @@ use crate::bounds::{
 };
 use crate::continuum_fitting::ContinuumFitter;
 use crate::convolve_rv::{
-    shift_and_resample, shift_resample_and_add_binary_components, ArraySegment, WavelengthDispersion
+    shift_and_resample, shift_resample_and_add_binary_components, ArraySegment,
+    WavelengthDispersion,
 };
 use crate::interpolate::{FluxFloat, Interpolator, WlGrid};
 use crate::particleswarm::{self};
@@ -12,8 +13,8 @@ use argmin::core::observers::{Observe, ObserverMode};
 use argmin::core::{CostFunction as _, Executor, PopulationState, State, KV};
 use argmin::solver::brent::BrentRoot;
 use itertools::Itertools;
-use nalgebra::{self as na, Storage};
-use serde::Serialize;
+use nalgebra::{self as na};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -159,8 +160,9 @@ pub struct PSOSettings {
 fn setup_pso<const N: usize, B: PSOBounds<N>>(
     bounds: B,
     settings: PSOSettings,
+    initial_positions: Option<Vec<na::SVector<f64, N>>>,
 ) -> particleswarm::ParticleSwarm<N, B, f64> {
-    particleswarm::ParticleSwarm::new(bounds, settings.num_particles)
+    particleswarm::ParticleSwarm::new(bounds, settings.num_particles, initial_positions)
         .with_inertia_factor(settings.inertia_factor)
         .unwrap()
         .with_cognitive_factor(settings.cognitive_factor)
@@ -208,22 +210,24 @@ impl<const N: usize>
 
 impl<const N: usize> Observer<N> for DummyObserver<N> {}
 
-#[derive(Serialize)]
-struct ParticleInfo {
-    position: Vec<f64>,
-    cost: f64,
+#[derive(Serialize, Deserialize)]
+pub struct ParticleInfo {
+    pub position: Vec<f64>,
+    pub cost: f64,
 }
 
 pub struct PSOobserver {
     dir: PathBuf,
     file_prefix: String,
+    iteration_offset: usize,
 }
 
 impl PSOobserver {
-    pub fn new(directory: &str, file_prefix: &str) -> Self {
+    pub fn new(directory: &str, file_prefix: &str, iteration_offset: usize) -> Self {
         Self {
             dir: PathBuf::from(directory),
             file_prefix: file_prefix.to_string(),
+            iteration_offset,
         }
     }
 }
@@ -237,7 +241,7 @@ impl<const N: usize>
         state: &PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
         _kv: &KV,
     ) -> Result<()> {
-        let iter = state.get_iter();
+        let iter = state.get_iter() + self.iteration_offset as u64;
         let particles = state
             .get_population()
             .ok_or(argmin::core::Error::msg("No particles"))?;
@@ -416,7 +420,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         };
         let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
             .with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone());
+        let solver = setup_pso(bounds, self.settings.clone(), None);
         let fitter = Executor::new(cost_function, solver)
             .configure(|state| state.max_iters(self.settings.max_iters));
         let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
@@ -639,6 +643,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> BinaryFitter<T, F> {
         observer: O,
         parallelize: bool,
         constraints: Vec<BoundsConstraint>,
+        initial_positions: Option<Vec<na::SVector<f64, 11>>>,
     ) -> Result<BinaryOptimizationResult> {
         let cost_function = BinaryCostFunction {
             interpolator,
@@ -655,7 +660,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> BinaryFitter<T, F> {
             self.rv_range,
         )
         .with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone());
+        let solver = setup_pso(bounds, self.settings.clone(), initial_positions);
         let fitter = Executor::new(cost_function, solver)
             .configure(|state| state.max_iters(self.settings.max_iters));
 
@@ -831,7 +836,7 @@ impl<F: ContinuumFitter, D: WavelengthDispersion> BinaryRVFitter<F, D> {
             synth_wl: &self.synth_wl,
         };
         let bounds = BinaryRVBounds::new(self.rv_range).with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone());
+        let solver = setup_pso(bounds, self.settings.clone(), None);
         let fitter = Executor::new(cost_function.clone(), solver)
             .configure(|state| state.max_iters(self.settings.max_iters));
 
@@ -1002,7 +1007,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> BinaryTimeriesKnownRVFitter<T,
         let bounds =
             BinaryBoundsWithoutRV::new(interpolator.grid_bounds(), (0.0, 1.0), self.vsini_range)
                 .with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone());
+        let solver = setup_pso(bounds, self.settings.clone(), None);
         let fitter = Executor::new(cost_function, solver)
             .configure(|state| state.max_iters(self.settings.max_iters));
 
@@ -1150,7 +1155,7 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter, B: PSOBounds<
                     continuum2: &continuum2,
                     light_ratio,
                 };
-                let solver = setup_pso(self.rv_bounds.clone(), self.rv_fit_settings.clone());
+                let solver = setup_pso(self.rv_bounds.clone(), self.rv_fit_settings.clone(), None);
                 let fitter = Executor::new(inner_cost_function, solver)
                     .configure(|state| state.max_iters(self.rv_fit_settings.max_iters));
                 let result = fitter.run()?;

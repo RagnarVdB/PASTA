@@ -28,6 +28,7 @@ num-traits = "0.2.19"
 approx = "0.5.1"
 zstd = "0.13.2"
 tar = "0.4.43"
+regex = "1.11.1"
 
 [dependencies.pyo3]
 version = "0.21.1"
