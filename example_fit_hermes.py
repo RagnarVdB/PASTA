@@ -152,7 +152,7 @@ for file in tqdm(flux_files):
     # Teff and vsini are relative to the solution value, others absolute.
     search_radius = [1 / 10, 0.8, 1.0, 0.5, 60.0]
     uncertainty = fitter.compute_uncertainty(
-        interpolator, flux, var, 86_000, solution.label, search_radius
+        interpolator, flux, var, 86_000, solution.label.as_list(), search_radius
     )
 
     # Convert the outputs to dictionaries, and write to json file

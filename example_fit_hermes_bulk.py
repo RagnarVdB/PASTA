@@ -155,7 +155,7 @@ for i in trange(0, len(flux_files), chunksize):
         fluxes,
         variances,
     )
-    labels = [sol.label for sol in chunk_solutions]
+    labels = [sol.label.as_list() for sol in chunk_solutions]
     chunk_uncertainties = fitter.compute_uncertainty_bulk(
         interpolator,
         fluxes,
