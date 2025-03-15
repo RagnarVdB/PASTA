@@ -8,7 +8,7 @@ pub mod interpolate;
 pub mod model_fetchers;
 pub mod particleswarm;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bounds::{BoundsConstraint, Constraint};
 use continuum_fitting::{
     ChunkFitter, ConstantContinuum as RsConstantContinuum, ContinuumFitter,
@@ -21,8 +21,8 @@ use convolve_rv::{
 use cubic::{calculate_interpolation_coefficients, calculate_interpolation_coefficients_flat};
 use enum_dispatch::enum_dispatch;
 use fitting::{
-    BestParticleObserver, BinaryFitter, BinaryRVFitter, BinaryTimeriesKnownRVFitter, DummyObserver,
-    ObservedSpectrum, Observer, PSOobserver, ParticleInfo, SingleFitter,
+    BinaryFitter, BinaryRVFitter, BinaryTimeriesKnownRVFitter, ObservedSpectrum, Observer,
+    ParticleInfo, SingleFitter,
 };
 use indicatif::ProgressBar;
 use interpolate::{FluxFloat, GridInterpolator, Interpolator};
@@ -839,11 +839,16 @@ fn get_observer_and_init<const N: usize>(
     trace_directory: Option<String>,
     best_particle_file: Option<String>,
     resume: bool,
-) -> (Box<dyn Observer<N>>, Option<Vec<na::SVector<f64, N>>>) {
+) -> (Observer, Option<Vec<na::SVector<f64, N>>>) {
     match (trace_directory, best_particle_file, resume) {
-        (Some(trace_directory), None, false) => {
-            (Box::new(PSOobserver::new(&trace_directory, "it", 0)), None)
-        }
+        (Some(trace_directory), None, false) => (
+            Observer::PSOobserver {
+                dir: trace_directory.into(),
+                file_prefix: "it".into(),
+                iteration_offset: 0,
+            },
+            None,
+        ),
         (Some(trace_directory), None, true) => {
             let paths = read_dir(&trace_directory).unwrap();
             let path_strings = paths
@@ -876,19 +881,26 @@ fn get_observer_and_init<const N: usize>(
                 .map(|p| na::SVector::<f64, N>::from_vec(p.position))
                 .collect::<Vec<_>>();
             (
-                Box::new(PSOobserver::new(&trace_directory, "it", iterations[i] + 1)),
+                Observer::PSOobserver {
+                    dir: trace_directory.into(),
+                    file_prefix: "it".into(),
+                    iteration_offset: iterations[i] + 1,
+                },
                 Some(positions),
             )
         }
         (None, Some(best_particle_file), false) => (
-            Box::new(BestParticleObserver::new(best_particle_file.into())),
+            Observer::BestParticleObserver {
+                filename: best_particle_file.into(),
+                iteration_offset: 0,
+            },
             None,
         ),
         (None, Some(_), true) => panic!("Cannot resumed from best particle info"),
         (Some(_), Some(_), _) => {
             panic!("Cannot specify both trace_directory and best_particle_file")
         }
-        _ => (Box::new(DummyObserver()), None),
+        _ => (Observer::DummyObserver, None),
     }
 }
 
@@ -1203,14 +1215,12 @@ macro_rules! implement_methods {
                 &self,
                 dispersion: PyWavelengthDispersion,
                 continuum_fitter: PyContinuumFitter,
-                settings: PSOSettings,
                 vsini_range: (f64, f64),
                 rv_range: (f64, f64),
             ) -> $PySingleFitter {
                 $PySingleFitter(SingleFitter::new(
                     dispersion.0,
                     continuum_fitter.0,
-                    settings.into(),
                     vsini_range,
                     rv_range,
                 ))
@@ -1221,14 +1231,12 @@ macro_rules! implement_methods {
                 &self,
                 dispersion: PyWavelengthDispersion,
                 continuum_fitter: PyContinuumFitter,
-                settings: PSOSettings,
                 vsini_range: (f64, f64),
                 rv_range: (f64, f64),
             ) -> $PyBinaryFitter {
                 $PyBinaryFitter(BinaryFitter::new(
                     dispersion.0,
                     continuum_fitter.0,
-                    settings.into(),
                     vsini_range,
                     rv_range,
                 ))
@@ -1241,14 +1249,12 @@ macro_rules! implement_methods {
                 dispersion: PyWavelengthDispersion,
                 synth_wl: WlGrid,
                 continuum_fitter: PyContinuumFitter,
-                settings: PSOSettings,
                 rv_range: (f64, f64),
             ) -> $PyRVFitter {
                 $PyRVFitter(BinaryRVFitter::new(
                     dispersion.0.clone(),
                     synth_wl.0,
                     continuum_fitter.0,
-                    settings.into(),
                     rv_range,
                 ))
             }
@@ -1258,14 +1264,12 @@ macro_rules! implement_methods {
                 dispersion: PyWavelengthDispersion,
                 synth_wl: WlGrid,
                 continuum_fitter: PyContinuumFitter,
-                settings: PSOSettings,
                 vsini_range: (f64, f64),
             ) -> $PyTSRVFitter {
                 $PyTSRVFitter(BinaryTimeriesKnownRVFitter::new(
                     dispersion.0,
                     synth_wl.0,
                     continuum_fitter.0,
-                    settings.into(),
                     vsini_range,
                 ))
             }
@@ -1522,6 +1526,9 @@ macro_rules! implement_methods {
                 interpolator: &$name,
                 observed_flux: PyArrayLike<FluxFloat, Ix1>,
                 observed_var: PyArrayLike<FluxFloat, Ix1>,
+                settings: PSOSettings,
+                first_stage_res: Option<f64>,
+                first_stage_iters: Option<u64>,
                 trace_directory: Option<String>,
                 best_particle_file: Option<String>,
                 parallelize: Option<bool>,
@@ -1538,13 +1545,29 @@ macro_rules! implement_methods {
                         .collect(),
                     None => vec![],
                 };
-                let result = self.0.fit(
-                    &interpolator.0,
-                    &observed_spectrum.into(),
-                    get_observer_and_init(trace_directory, best_particle_file, false).0,
-                    parallelize.unwrap_or(true),
-                    constraints,
-                )?;
+                let result = if let Some(first_stage_iters) = first_stage_iters {
+                    let mut first_settings = settings.0.clone();
+                    first_settings.max_iters = first_stage_iters;
+                    self.0.fit_two_stage(
+                        &interpolator.0,
+                        &observed_spectrum.into(),
+                        settings.into(),
+                        first_stage_res.unwrap_or(10_000.0),
+                        first_settings,
+                        get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
+                        parallelize.unwrap_or(true),
+                        constraints,
+                    )?
+                } else {
+                    self.0.fit(
+                        &interpolator.0,
+                        &observed_spectrum.into(),
+                        settings.into(),
+                        get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
+                        parallelize.unwrap_or(true),
+                        constraints,
+                    )?
+                };
                 Ok(result.into())
             }
 
@@ -1555,28 +1578,90 @@ macro_rules! implement_methods {
                 interpolator: &$name,
                 observed_fluxes: Vec<Vec<FluxFloat>>,
                 observed_vars: Vec<Vec<FluxFloat>>,
-                constraints: Option<Vec<PyConstraintWrapper>>,
-            ) -> PyResult<Vec<OptimizationResult>> {
-                let constraints = match constraints {
-                    Some(constraints) => constraints
-                        .into_iter()
-                        .map(|constraint| constraint.0)
-                        .collect(),
-                    None => vec![],
+                settings: PSOSettings,
+                first_stage_iters: Option<u64>,
+                constraints: Option<Vec<Vec<PyConstraintWrapper>>>,
+                best_particle_files: Option<Vec<String>>,
+                progress: Option<bool>,
+            ) -> PyResult<Vec<Option<OptimizationResult>>> {
+                let progress_bar = if progress.unwrap_or(false) {
+                    ProgressBar::new(observed_fluxes.len() as u64)
+                } else {
+                    ProgressBar::hidden()
                 };
+                let constraints = match constraints {
+                    Some(all_constraints) => all_constraints
+                        .into_iter()
+                        .map(|constraints| {
+                            constraints
+                                .into_iter()
+                                .map(|constraint| constraint.0)
+                                .collect()
+                        })
+                        .collect(),
+                    None => vec![vec![]; observed_fluxes.len()],
+                };
+                let observers = match best_particle_files {
+                    Some(files) => files
+                        .into_iter()
+                        .map(|file| Observer::BestParticleObserver {
+                            filename: file.into(),
+                            iteration_offset: 0,
+                        })
+                        .collect(),
+                    None => vec![Observer::DummyObserver; observed_fluxes.len()],
+                };
+                let first_settings = first_stage_iters.map(|i| {
+                    let mut first_settings = settings.0.clone();
+                    first_settings.max_iters = i;
+                    first_settings
+                });
                 Ok(observed_fluxes
                     .into_par_iter()
                     .zip(observed_vars)
-                    .map(|(flux, var)| {
+                    .zip(constraints)
+                    .zip(observers)
+                    .enumerate()
+                    .map(|(i, (((flux, var), constraint), observer))| {
                         let observed_spectrum = ObservedSpectrum::from_vecs(flux, var);
-                        let result = self.0.fit(
-                            &interpolator.0,
-                            &observed_spectrum.into(),
-                            DummyObserver(),
-                            false,
-                            constraints.clone(),
-                        );
-                        result.unwrap().into()
+                        let result = if let Some(first_settings) = first_settings.clone() {
+                            self.0.fit_two_stage(
+                                &interpolator.0,
+                                &observed_spectrum.into(),
+                                settings.clone().into(),
+                                10_000.0,
+                                first_settings,
+                                observer,
+                                false,
+                                constraint,
+                            )
+                        } else {
+                            self.0.fit(
+                                &interpolator.0,
+                                &observed_spectrum.into(),
+                                settings.clone().into(),
+                                observer,
+                                false,
+                                constraint,
+                            )
+                        };
+                        progress_bar.inc(1);
+                        // match result {
+                        //     Ok(result) => result,
+                        //     Err(err) => println!("Error for spectrum{}", )
+                        // }
+                        // if let Ok(result) = result {
+                        //     Some(result.into())
+                        // } else {
+                        //     println!("Error for spectrum {}", i);
+                        //     None
+                        // }
+                        Some(
+                            result
+                                .with_context(|| format!("Error for spectrum {}", i))
+                                .unwrap()
+                                .into(),
+                        )
                     })
                     .collect::<Vec<_>>())
             }
@@ -1658,11 +1743,11 @@ macro_rules! implement_methods {
                             .0
                             .chi2(&interpolator.0, &observed_spectrum, labels.into());
                         match allow_nan {
-                            Some(false) => chi.unwrap(),
-                            _ => match chi {
+                            Some(true) => match chi {
                                 Ok(x) => x,
                                 Err(_) => f64::NAN,
                             },
+                            _ => chi.unwrap()
                         }
                     })
                     .collect())
@@ -1682,6 +1767,7 @@ macro_rules! implement_methods {
                 continuum_interpolator: &$name,
                 observed_flux: PyArrayLike<FluxFloat, Ix1>,
                 observed_var: PyArrayLike<FluxFloat, Ix1>,
+                settings: PSOSettings,
                 trace_directory: Option<String>,
                 best_particle_file: Option<String>,
                 parallelize: Option<bool>,
@@ -1708,12 +1794,104 @@ macro_rules! implement_methods {
                     &interpolator.0,
                     &continuum_interpolator.0,
                     &observed_spectrum.into(),
+                    settings.into(),
                     observer,
                     parallelize.unwrap_or(true),
                     constraints,
                     initial_positions,
                 );
                 Ok(result?.into())
+            }
+
+            pub fn fit_two_stage(
+                &self,
+                interpolator: &$name,
+                continuum_interpolator: &$name,
+                observed_flux: PyArrayLike<FluxFloat, Ix1>,
+                observed_var: PyArrayLike<FluxFloat, Ix1>,
+                settings1: PSOSettings,
+                settings2: PSOSettings,
+                trace_directory: Option<String>,
+                best_particle_file: Option<String>,
+                parallelize: Option<bool>,
+                constraints: Option<Vec<PyConstraintWrapper>>,
+                resume: Option<bool>,
+            ) -> PyResult<BinaryOptimizationResult> {
+                let observed_spectrum = ObservedSpectrum {
+                    flux: observed_flux.as_matrix().column(0).into_owned(),
+                    var: observed_var.as_matrix().column(0).into_owned(),
+                };
+                let constraints = match constraints {
+                    Some(constraints) => constraints
+                        .into_iter()
+                        .map(|constraint| constraint.0)
+                        .collect(),
+                    None => vec![],
+                };
+                let (observer, initial_positions) = get_observer_and_init(
+                    trace_directory,
+                    best_particle_file,
+                    resume.unwrap_or(false),
+                );
+                let result = self.0.fit_two_stage(
+                    &interpolator.0,
+                    &continuum_interpolator.0,
+                    &observed_spectrum.into(),
+                    settings1.into(),
+                    settings2.into(),
+                    observer,
+                    parallelize.unwrap_or(true),
+                    constraints,
+                    initial_positions,
+                );
+                Ok(result?.into())
+            }
+
+            pub fn fit_two_stage_bulk(
+                &self,
+                interpolator: &$name,
+                continuum_interpolator: &$name,
+                observed_fluxes: Vec<Vec<FluxFloat>>,
+                observed_vars: Vec<Vec<FluxFloat>>,
+                settings1: PSOSettings,
+                settings2: PSOSettings,
+                constraints: Option<Vec<Vec<PyConstraintWrapper>>>,
+            ) -> PyResult<Vec<BinaryOptimizationResult>> {
+                let n = observed_fluxes.len();
+                let constraints = match constraints {
+                    Some(constraints) => constraints
+                        .into_iter()
+                        .map(|constraint| {
+                            constraint
+                                .into_iter()
+                                .map(|constraint| constraint.0)
+                                .collect()
+                        })
+                        .collect(),
+                    None => vec![vec![]; n],
+                };
+                Ok(observed_fluxes
+                    .into_par_iter()
+                    .zip(observed_vars)
+                    .zip(constraints)
+                    .map(|((flux, var), constraint)| {
+                        let observed_spectrum = ObservedSpectrum::from_vecs(flux, var);
+                        self.0
+                            .fit_two_stage(
+                                &interpolator.0,
+                                &continuum_interpolator.0,
+                                &observed_spectrum.into(),
+                                settings1.clone().into(),
+                                settings2.clone().into(),
+                                Observer::DummyObserver,
+                                false,
+                                constraint,
+                                None,
+                            )
+                            .unwrap()
+                            .into()
+                    })
+                    .collect::<Vec<_>>())
             }
 
             pub fn chi2(
@@ -1761,6 +1939,7 @@ macro_rules! implement_methods {
                 light_ratio: f64,
                 observed_flux: Vec<FluxFloat>,
                 observed_var: Vec<FluxFloat>,
+                settings: PSOSettings,
                 trace_directory: Option<String>,
                 best_particle_file: Option<String>,
                 constraints: Option<Vec<PyConstraintWrapper>>,
@@ -1780,7 +1959,8 @@ macro_rules! implement_methods {
                     &continuum2.into(),
                     light_ratio,
                     &observed_spectrum,
-                    get_observer_and_init(trace_directory, best_particle_file, false).0,
+                    settings.into(),
+                    get_observer_and_init::<2>(trace_directory, best_particle_file, false).0,
                     constraints,
                 );
                 Ok(result?.into())
@@ -1840,6 +2020,7 @@ macro_rules! implement_methods {
                 continuum_interpolator: &$name,
                 observed_fluxes: Vec<Vec<FluxFloat>>,
                 observed_vars: Vec<Vec<FluxFloat>>,
+                settings: PSOSettings,
                 rvs: Vec<[f64; 2]>,
                 trace_directory: Option<String>,
                 best_particle_file: Option<String>,
@@ -1862,8 +2043,9 @@ macro_rules! implement_methods {
                     &interpolator.0,
                     &continuum_interpolator.0,
                     &observed_spectra,
+                    settings.into(),
                     &rvs,
-                    get_observer_and_init(trace_directory, best_particle_file, false).0,
+                    get_observer_and_init::<9>(trace_directory, best_particle_file, false).0,
                     parallelize.unwrap_or(true),
                     constraints,
                 );

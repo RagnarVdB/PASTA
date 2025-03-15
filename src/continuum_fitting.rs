@@ -392,6 +392,12 @@ impl ContinuumFitter for ChunkFitter {
         );
         let chi2 =
             self.compute_chi2_from_chunks(pfits.clone(), observed_spectrum, synthetic_spectrum)?;
+        if f64::is_nan(chi2) {
+            bail!("Chi2 is NaN, params: {:?}", params);
+        }
+        if f64::is_infinite(chi2) {
+            bail!("Chi2 is infinite, params: {:?}", params);
+        }
         Ok((params, chi2))
     }
 

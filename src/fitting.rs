@@ -4,7 +4,7 @@ use crate::bounds::{
 use crate::continuum_fitting::ContinuumFitter;
 use crate::convolve_rv::{
     shift_and_resample, shift_resample_and_add_binary_components, ArraySegment,
-    WavelengthDispersion,
+    FixedTargetDispersionLogSpace, WavelengthDispersion,
 };
 use crate::interpolate::{FluxFloat, Interpolator, WlGrid};
 use crate::particleswarm::{self};
@@ -16,7 +16,7 @@ use itertools::Itertools;
 use nalgebra::{self as na};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 
 /// Observed specrum with flux and variance
@@ -173,131 +173,113 @@ fn setup_pso<const N: usize, B: PSOBounds<N>>(
         .unwrap()
 }
 
-pub trait Observer<const N: usize>:
-    Observe<PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>> + 'static
-{
-}
-
-impl<const N: usize>
-    Observe<PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>>
-    for Box<dyn Observer<N>>
-{
-    fn observe_iter(
-        &mut self,
-        state: &PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
-        kv: &KV,
-    ) -> std::result::Result<(), anyhow::Error> {
-        self.as_mut().observe_iter(state, kv)
-    }
-}
-
-impl<const N: usize> Observer<N> for Box<dyn Observer<N>> {}
-
-pub struct DummyObserver<const N: usize>();
-
-impl<const N: usize>
-    Observe<PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>>
-    for DummyObserver<N>
-{
-    fn observe_iter(
-        &mut self,
-        _state: &PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
-        _kv: &KV,
-    ) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl<const N: usize> Observer<N> for DummyObserver<N> {}
-
 #[derive(Serialize, Deserialize)]
 pub struct ParticleInfo {
     pub position: Vec<f64>,
     pub cost: f64,
 }
 
-pub struct PSOobserver {
-    dir: PathBuf,
-    file_prefix: String,
-    iteration_offset: usize,
+#[derive(Clone)]
+pub enum Observer {
+    DummyObserver,
+    PSOobserver {
+        dir: PathBuf,
+        file_prefix: String,
+        iteration_offset: usize,
+    },
+    BestParticleObserver {
+        filename: PathBuf,
+        iteration_offset: usize,
+    },
 }
 
-impl PSOobserver {
-    pub fn new(directory: &str, file_prefix: &str, iteration_offset: usize) -> Self {
-        Self {
-            dir: PathBuf::from(directory),
-            file_prefix: file_prefix.to_string(),
-            iteration_offset,
+impl Observer {
+    fn with_iteration_offset(&self, iteration_offset: usize) -> Observer {
+        match self {
+            Self::DummyObserver => Self::DummyObserver,
+            Self::PSOobserver {
+                dir,
+                file_prefix,
+                iteration_offset: _,
+            } => Self::PSOobserver {
+                dir: dir.clone(),
+                file_prefix: file_prefix.clone(),
+                iteration_offset,
+            },
+            Self::BestParticleObserver {
+                filename,
+                iteration_offset: _,
+            } => Self::BestParticleObserver {
+                filename: filename.clone(),
+                iteration_offset,
+            },
         }
     }
 }
 
 impl<const N: usize>
-    Observe<PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>>
-    for PSOobserver
+    Observe<PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>> for Observer
 {
     fn observe_iter(
         &mut self,
         state: &PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
-        _kv: &KV,
-    ) -> Result<()> {
-        let iter = state.get_iter() + self.iteration_offset as u64;
-        let particles = state
-            .get_population()
-            .ok_or(argmin::core::Error::msg("No particles"))?;
-        let values = particles
-            .iter()
-            .map(|p| ParticleInfo {
-                position: p.position.data.as_slice().to_owned(),
-                cost: p.cost,
-            })
-            .collect::<Vec<_>>();
-        let filename = self.dir.join(format!("{}_{}.json", self.file_prefix, iter));
-        let f = BufWriter::new(File::create(filename)?);
-        serde_json::to_writer(f, &values)?;
-        Ok(())
-    }
-}
-
-impl<const N: usize> Observer<N> for PSOobserver {}
-
-pub struct BestParticleObserver<const N: usize> {
-    file: PathBuf,
-    best_particles: Vec<ParticleInfo>,
-}
-
-impl<const N: usize> BestParticleObserver<N> {
-    pub fn new(file: PathBuf) -> Self {
-        Self {
-            file,
-            best_particles: Vec::new(),
+        kv: &KV,
+    ) -> std::result::Result<(), anyhow::Error> {
+        match self {
+            Self::DummyObserver => Ok(()),
+            Self::PSOobserver {
+                dir,
+                file_prefix,
+                iteration_offset,
+            } => {
+                let iter = state.get_iter() + *iteration_offset as u64;
+                let particles = state
+                    .get_population()
+                    .ok_or(argmin::core::Error::msg("No particles"))?;
+                let values = particles
+                    .iter()
+                    .map(|p| ParticleInfo {
+                        position: p.position.data.as_slice().to_owned(),
+                        cost: p.cost,
+                    })
+                    .collect::<Vec<_>>();
+                let filename = dir.join(format!("{}_{}.json", file_prefix, iter));
+                let f = BufWriter::new(File::create(filename)?);
+                serde_json::to_writer(f, &values)?;
+                Ok(())
+            }
+            Self::BestParticleObserver {
+                filename,
+                iteration_offset,
+            } => {
+                let iter = state.get_iter() as usize + *iteration_offset;
+                let best_particle = state
+                    .get_best_param()
+                    .ok_or(argmin::core::Error::msg("No best particle"))?;
+                let particle_info = ParticleInfo {
+                    position: best_particle.position.data.as_slice().to_owned(),
+                    cost: best_particle.cost,
+                };
+                let mut particles = if filename.exists() {
+                    let file = File::open(filename.clone())?;
+                    let reader = BufReader::new(file);
+                    serde_json::from_reader(reader)?
+                } else {
+                    let file = File::create(&filename)?;
+                    Vec::new()
+                };
+                if particles.len() <= iter {
+                    particles.push(particle_info);
+                } else {
+                    particles[iter] = particle_info;
+                }
+                let file = File::create(filename)?;
+                serde_json::to_writer(&file, &particles)?;
+                Ok(())
+            }
         }
     }
 }
-
-impl<const N: usize>
-    Observe<PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>>
-    for BestParticleObserver<N>
-{
-    fn observe_iter(
-        &mut self,
-        state: &PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
-        _kv: &KV,
-    ) -> Result<()> {
-        let best_particle = state
-            .get_best_param()
-            .ok_or(argmin::core::Error::msg("No best particle"))?;
-        let particle_info = ParticleInfo {
-            position: best_particle.position.data.as_slice().to_owned(),
-            cost: best_particle.cost,
-        };
-        self.best_particles.push(particle_info);
-        serde_json::to_writer(&File::create(&self.file)?, &self.best_particles)?;
-        Ok(())
-    }
-}
-
-impl<const N: usize> Observer<N> for BestParticleObserver<N> {}
 
 /// Cost function used in the PSO fitting
 struct CostFunction<'a, I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> {
@@ -325,7 +307,8 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
                 .produce_model(self.target_dispersion, teff, m, logg, vsini, rv)?;
         let (_, ls) = self
             .continuum_fitter
-            .fit_continuum(self.observed_spectrum, &synth_spec)?;
+            .fit_continuum(self.observed_spectrum, &synth_spec)
+            .context(format!("Error fitting continuum for params={:?}", params))?;
         Ok(ls)
     }
 
@@ -370,7 +353,11 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
             ))?;
         let (_, chi2) = self
             .continuum_fitter
-            .fit_continuum(self.observed_spectrum, &synth_spec)?;
+            .fit_continuum(self.observed_spectrum, &synth_spec)
+            .context(format!(
+                "Error computing cost with param={:?}, new_label={:?}",
+                param, new_label
+            ))?;
         Ok(chi2 - self.target_value)
     }
 }
@@ -378,7 +365,6 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
 pub struct SingleFitter<T: WavelengthDispersion, F: ContinuumFitter> {
     target_dispersion: T,
     continuum_fitter: F,
-    settings: PSOSettings,
     vsini_range: (f64, f64),
     rv_range: (f64, f64),
 }
@@ -387,14 +373,12 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
     pub fn new(
         target_dispersion: T,
         continuum_fitter: F,
-        settings: PSOSettings,
         vsini_range: (f64, f64),
         rv_range: (f64, f64),
     ) -> Self {
         Self {
             target_dispersion,
             continuum_fitter,
-            settings,
             vsini_range,
             rv_range,
         }
@@ -404,7 +388,8 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         &self,
         interpolator: &impl Interpolator,
         observed_spectrum: &ObservedSpectrum,
-        observer: impl Observer<5>,
+        settings: PSOSettings,
+        observer: Observer,
         parallelize: bool,
         constraints: Vec<BoundsConstraint>,
     ) -> Result<OptimizationResult> {
@@ -420,15 +405,155 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         };
         let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
             .with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone(), None);
+        let solver = setup_pso(bounds, settings.clone(), None);
         let fitter = Executor::new(cost_function, solver)
-            .configure(|state| state.max_iters(self.settings.max_iters));
+            .configure(|state| state.max_iters(settings.max_iters));
         let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
 
         let best_param = result
             .state
-            .best_individual
-            .ok_or(anyhow!("No best parameter found"))?
+            .get_population()
+            .ok_or(anyhow!("No population"))?
+            .iter()
+            .min_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap())
+            .unwrap()
+            .position;
+
+        let teff = best_param[0];
+        let m = best_param[1];
+        let logg = best_param[2];
+        let vsini = best_param[3];
+        let rv = best_param[4];
+
+        let synth_spec =
+            interpolator.produce_model(&self.target_dispersion, teff, m, logg, vsini, rv)?;
+        let (continuum_params, _) = self
+            .continuum_fitter
+            .fit_continuum(observed_spectrum, &synth_spec)?;
+        let time = match result.state.time {
+            Some(t) => t.as_secs_f64(),
+            None => 0.0,
+        };
+        Ok(OptimizationResult {
+            label: Label {
+                teff,
+                m,
+                logg,
+                vsini,
+                rv,
+            },
+            continuum_params,
+            chi2: result.state.best_cost,
+            time,
+            iters: result.state.iter,
+        })
+    }
+
+    pub fn fit_two_stage(
+        &self,
+        interpolator: &impl Interpolator,
+        observed_spectrum: &ObservedSpectrum,
+        settings: PSOSettings,
+        first_stage_res: f64,
+        first_stage_settings: PSOSettings,
+        observer: Observer,
+        parallelize: bool,
+        constraints: Vec<BoundsConstraint>,
+    ) -> Result<OptimizationResult> {
+        if observed_spectrum.flux.len() != self.target_dispersion.wavelength().len() {
+            bail!("Observed spectrum and target dispersion must have the same length");
+        }
+
+        // First stage
+        let obs_wl = self.target_dispersion.wavelength();
+        let disp_obs = FixedTargetDispersionLogSpace::new(
+            na::DVector::from_iterator(
+                interpolator.synth_wl().n(),
+                interpolator.synth_wl().iterate(),
+            ),
+            first_stage_res,
+            &WlGrid::Logspace(
+                obs_wl[0],
+                obs_wl[1].log10() - obs_wl[0].log10(),
+                obs_wl.len(),
+            ),
+        )?;
+        let observed_flux_convolved = disp_obs.convolve(observed_spectrum.flux.clone())?;
+        let observed_var_convolved = disp_obs.convolve(observed_spectrum.var.clone())?;
+        let observed_convolved = ObservedSpectrum {
+            flux: observed_flux_convolved,
+            var: observed_var_convolved,
+        };
+        let disp_synth = FixedTargetDispersionLogSpace::new(
+            self.target_dispersion.wavelength().clone(),
+            first_stage_res,
+            &interpolator.synth_wl(),
+        )?;
+        // let observed_convolved =
+        let cost_function = CostFunction {
+            interpolator,
+            target_dispersion: &disp_synth,
+            observed_spectrum: &observed_convolved,
+            continuum_fitter: &self.continuum_fitter,
+            parallelize,
+        };
+        let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
+            .with_constraints(constraints.clone());
+        let solver = setup_pso(bounds, first_stage_settings.clone(), None);
+        let fitter = Executor::new(cost_function, solver)
+            .configure(|state| state.max_iters(first_stage_settings.max_iters));
+        let result = fitter.run()?;
+        let positions = result
+            .state
+            .get_population()
+            .ok_or(anyhow!("No population first stage"))?
+            .iter()
+            .map(|p| p.position)
+            .collect::<Vec<_>>();
+
+        // Second stage
+        let cost_function = CostFunction {
+            interpolator,
+            target_dispersion: &self.target_dispersion,
+            observed_spectrum,
+            continuum_fitter: &self.continuum_fitter,
+            parallelize,
+        };
+        let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
+            .with_constraints(constraints);
+        // Take positions from part one as starting point
+        let solver = setup_pso(bounds, settings.clone(), Some(positions.clone()));
+        let fitter = Executor::new(cost_function, solver)
+            .configure(|state| state.max_iters(settings.max_iters));
+        let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
+
+        // let best_param = result
+        //     .state
+        //     .clone()
+        //     .best_individual
+        //     .ok_or(anyhow!("No best parameter found second stage: \n old: {:?}\n\n new: {:?}", positions, result.state.clone().get_population().unwrap().iter()
+        //     .map(|p| p.position)
+        //     .collect::<Vec<_>>()))?
+        //     .position;
+
+        let best_param = result
+            .state
+            .get_population()
+            .ok_or(anyhow!("No population second stage"))?
+            .iter()
+            .min_by(|a, b| {
+                a.cost
+                    .partial_cmp(&b.cost)
+                    .ok_or(anyhow!(
+                        "Failed comparison {}, {}: {}, {}",
+                        a.cost,
+                        b.cost,
+                        a.position,
+                        b.position
+                    ))
+                    .unwrap()
+            })
+            .unwrap()
             .position;
 
         let teff = best_param[0];
@@ -572,6 +697,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
     }
 }
 
+#[derive(Clone)]
 struct BinaryCostFunction<'a, I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> {
     interpolator: &'a I,
     continuum_interpolator: &'a I,
@@ -613,7 +739,6 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
 pub struct BinaryFitter<T: WavelengthDispersion, F: ContinuumFitter> {
     target_dispersion: T,
     continuum_fitter: F,
-    settings: PSOSettings,
     vsini_range: (f64, f64),
     rv_range: (f64, f64),
 }
@@ -622,25 +747,24 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> BinaryFitter<T, F> {
     pub fn new(
         target_dispersion: T,
         continuum_fitter: F,
-        settings: PSOSettings,
         vsini_range: (f64, f64),
         rv_range: (f64, f64),
     ) -> Self {
         Self {
             target_dispersion,
             continuum_fitter,
-            settings,
             vsini_range,
             rv_range,
         }
     }
 
-    pub fn fit<I: Interpolator, O: Observer<11>>(
+    pub fn fit<I: Interpolator>(
         &self,
         interpolator: &I,
         continuum_interpolator: &I,
         observed_spectrum: &ObservedSpectrum,
-        observer: O,
+        settings: PSOSettings,
+        observer: Observer,
         parallelize: bool,
         constraints: Vec<BoundsConstraint>,
         initial_positions: Option<Vec<na::SVector<f64, 11>>>,
@@ -660,16 +784,127 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> BinaryFitter<T, F> {
             self.rv_range,
         )
         .with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone(), initial_positions);
+        let solver = setup_pso(bounds, settings.clone(), initial_positions);
         let fitter = Executor::new(cost_function, solver)
-            .configure(|state| state.max_iters(self.settings.max_iters));
+            .configure(|state| state.max_iters(settings.max_iters));
 
         let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
 
         let best_param = result
             .state
-            .best_individual
-            .ok_or(anyhow!("No best parameter found"))?
+            .get_population()
+            .ok_or(anyhow!("No population"))?
+            .iter()
+            .min_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap())
+            .unwrap()
+            .position;
+
+        let star1_parameters = best_param.fixed_rows::<5>(0).into_owned();
+        let star2_parameters = best_param.fixed_rows::<5>(5).into_owned();
+        let light_ratio = best_param[10];
+
+        let synth_spec = interpolator.produce_binary_model_norm(
+            continuum_interpolator,
+            &self.target_dispersion,
+            &star1_parameters,
+            &star2_parameters,
+            light_ratio as f32,
+        )?;
+        let (continuum_params, _) = self
+            .continuum_fitter
+            .fit_continuum(observed_spectrum, &synth_spec)?;
+        let time = match result.state.time {
+            Some(t) => t.as_secs_f64(),
+            None => 0.0,
+        };
+        Ok(BinaryOptimizationResult {
+            label1: best_param.fixed_rows::<5>(0).into(),
+            label2: best_param.fixed_rows::<5>(5).into(),
+            light_ratio: best_param[10],
+            continuum_params,
+            chi2: result.state.best_cost,
+            time,
+            iters: result.state.iter,
+        })
+    }
+
+    pub fn fit_two_stage<I: Interpolator>(
+        &self,
+        interpolator: &I,
+        continuum_interpolator: &I,
+        observed_spectrum: &ObservedSpectrum,
+        settings1: PSOSettings,
+        settings2: PSOSettings,
+        observer: Observer,
+        parallelize: bool,
+        constraints: Vec<BoundsConstraint>,
+        initial_positions: Option<Vec<na::SVector<f64, 11>>>,
+    ) -> Result<BinaryOptimizationResult> {
+        let cost_function = BinaryCostFunction {
+            interpolator,
+            continuum_interpolator,
+            target_dispersion: &self.target_dispersion,
+            observed_spectrum,
+            continuum_fitter: &self.continuum_fitter,
+            parallelize,
+        };
+        let bounds = BinaryBounds::new(
+            interpolator.grid_bounds(),
+            (0.0, 1.0),
+            self.vsini_range,
+            self.rv_range,
+        )
+        .with_constraints(constraints);
+
+        let second_observer = observer.with_iteration_offset(settings2.max_iters as usize);
+        // First part
+        let solver = setup_pso(bounds.clone(), settings1.clone(), initial_positions);
+        let fitter = Executor::new(cost_function, solver)
+            .configure(|state| state.max_iters(settings1.max_iters));
+        let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
+
+        let positions = result
+            .state
+            .get_population()
+            .ok_or(anyhow!("No population"))?
+            .iter()
+            .map(|p| p.position)
+            .collect::<Vec<_>>();
+
+        // Second part
+        let cost_function = BinaryCostFunction {
+            interpolator,
+            continuum_interpolator,
+            target_dispersion: &self.target_dispersion,
+            observed_spectrum,
+            continuum_fitter: &self.continuum_fitter,
+            parallelize,
+        };
+        let solver = setup_pso(bounds, settings2.clone(), Some(positions));
+        let fitter = Executor::new(cost_function, solver)
+            .configure(|state| state.max_iters(settings2.max_iters));
+        let result = fitter
+            .add_observer(second_observer, ObserverMode::Always)
+            .run()?;
+
+        let best_param = result
+            .state
+            .get_population()
+            .ok_or(anyhow!("No population"))?
+            .iter()
+            .min_by(|a, b| {
+                a.cost
+                    .partial_cmp(&b.cost)
+                    .ok_or(anyhow!(
+                        "Failed comparison {}, {}: {}, {}",
+                        a.cost,
+                        b.cost,
+                        a.position,
+                        b.position
+                    ))
+                    .unwrap()
+            })
+            .unwrap()
             .position;
 
         let star1_parameters = best_param.fixed_rows::<5>(0).into_owned();
@@ -792,7 +1027,6 @@ pub struct BinaryRVFitter<F: ContinuumFitter, D: WavelengthDispersion> {
     observed_dispersion: D,
     synth_wl: WlGrid,
     continuum_fitter: F,
-    settings: PSOSettings,
     rv_range: (f64, f64),
 }
 
@@ -801,14 +1035,12 @@ impl<F: ContinuumFitter, D: WavelengthDispersion> BinaryRVFitter<F, D> {
         observed_dispersion: D,
         synth_wl: WlGrid,
         continuum_fitter: F,
-        settings: PSOSettings,
         rv_range: (f64, f64),
     ) -> Self {
         Self {
             observed_dispersion,
             synth_wl,
             continuum_fitter,
-            settings,
             rv_range,
         }
     }
@@ -821,7 +1053,8 @@ impl<F: ContinuumFitter, D: WavelengthDispersion> BinaryRVFitter<F, D> {
         continuum2: &ArraySegment,
         light_ratio: f64,
         observed_spectrum: &ObservedSpectrum,
-        observer: impl Observer<2>,
+        settings: PSOSettings,
+        observer: Observer,
         constraints: Vec<BoundsConstraint>,
     ) -> Result<BinaryRVOptimizationResult> {
         let cost_function = RVCostFunction {
@@ -836,9 +1069,9 @@ impl<F: ContinuumFitter, D: WavelengthDispersion> BinaryRVFitter<F, D> {
             synth_wl: &self.synth_wl,
         };
         let bounds = BinaryRVBounds::new(self.rv_range).with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone(), None);
+        let solver = setup_pso(bounds, settings.clone(), None);
         let fitter = Executor::new(cost_function.clone(), solver)
-            .configure(|state| state.max_iters(self.settings.max_iters));
+            .configure(|state| state.max_iters(settings.max_iters));
 
         let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
 
@@ -848,8 +1081,11 @@ impl<F: ContinuumFitter, D: WavelengthDispersion> BinaryRVFitter<F, D> {
         };
         let best_param = result
             .state
-            .best_individual
-            .ok_or(anyhow!("No best parameter found"))?
+            .get_population()
+            .ok_or(anyhow!("No population"))?
+            .iter()
+            .min_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap())
+            .unwrap()
             .position;
         let chi2 = result.state.best_cost;
         let rv1 = best_param[0];
@@ -963,7 +1199,6 @@ pub struct BinaryTimeriesKnownRVFitter<T: WavelengthDispersion, F: ContinuumFitt
     target_dispersion: T,
     synth_wl: WlGrid,
     continuum_fitter: F,
-    settings: PSOSettings,
     vsini_range: (f64, f64),
 }
 
@@ -972,25 +1207,24 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> BinaryTimeriesKnownRVFitter<T,
         target_dispersion: T,
         synth_wl: WlGrid,
         continuum_fitter: F,
-        settings: PSOSettings,
         vsini_range: (f64, f64),
     ) -> Self {
         Self {
             target_dispersion,
             synth_wl,
             continuum_fitter,
-            settings,
             vsini_range,
         }
     }
 
-    pub fn fit<I: Interpolator, O: Observer<9>>(
+    pub fn fit<I: Interpolator>(
         &self,
         interpolator: &I,
         continuum_interpolator: &I,
         observed_spectra: &Vec<ObservedSpectrum>,
+        settings: PSOSettings,
         rvs: &Vec<[f64; 2]>,
-        observer: O,
+        observer: Observer,
         parallelize: bool,
         constraints: Vec<BoundsConstraint>,
     ) -> Result<BinaryTimeseriesOptimizationResult> {
@@ -1007,16 +1241,19 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> BinaryTimeriesKnownRVFitter<T,
         let bounds =
             BinaryBoundsWithoutRV::new(interpolator.grid_bounds(), (0.0, 1.0), self.vsini_range)
                 .with_constraints(constraints);
-        let solver = setup_pso(bounds, self.settings.clone(), None);
+        let solver = setup_pso(bounds, settings.clone(), None);
         let fitter = Executor::new(cost_function, solver)
-            .configure(|state| state.max_iters(self.settings.max_iters));
+            .configure(|state| state.max_iters(settings.max_iters));
 
         let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
 
         let best_param = result
             .state
-            .best_individual
-            .ok_or(anyhow!("No best parameter found"))?
+            .get_population()
+            .ok_or(anyhow!("No population"))?
+            .iter()
+            .min_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap())
+            .unwrap()
             .position;
 
         let star1_parameters = best_param.fixed_rows::<4>(0).into_owned();
