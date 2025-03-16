@@ -1527,7 +1527,7 @@ macro_rules! implement_methods {
                 observed_flux: PyArrayLike<FluxFloat, Ix1>,
                 observed_var: PyArrayLike<FluxFloat, Ix1>,
                 settings: PSOSettings,
-                iterations: Option<[u64; 2]>,
+                iterations: Option<[u64; 3]>,
                 first_stage_res: Option<f64>,
                 trace_directory: Option<String>,
                 best_particle_file: Option<String>,
@@ -1547,11 +1547,15 @@ macro_rules! implement_methods {
                 };
                 Ok(self
                     .0
-                    .fit_two_stage(
+                    .fit_three_stage(
                         &interpolator.0,
                         &observed_spectrum.into(),
-                        [settings.clone().into(), settings.into()],
-                        iterations.unwrap_or([30, 70]),
+                        [
+                            settings.clone().into(),
+                            settings.clone().into(),
+                            settings.into(),
+                        ],
+                        iterations.unwrap_or([30, 60, 10]),
                         first_stage_res.unwrap_or(10_000.0),
                         get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
                         parallelize.unwrap_or(true),
@@ -1568,7 +1572,8 @@ macro_rules! implement_methods {
                 observed_fluxes: Vec<Vec<FluxFloat>>,
                 observed_vars: Vec<Vec<FluxFloat>>,
                 settings: PSOSettings,
-                iterations: Option<[u64; 2]>,
+                iterations: Option<[u64; 3]>,
+                first_stage_res: Option<f64>,
                 constraints: Option<Vec<Vec<PyConstraintWrapper>>>,
                 best_particle_files: Option<Vec<String>>,
                 progress: Option<bool>,
@@ -1608,12 +1613,16 @@ macro_rules! implement_methods {
                     .enumerate()
                     .map(|(i, (((flux, var), constraint), observer))| {
                         let observed_spectrum = ObservedSpectrum::from_vecs(flux, var);
-                        let result = self.0.fit_two_stage(
+                        let result = self.0.fit_three_stage(
                             &interpolator.0,
                             &observed_spectrum.into(),
-                            [settings.clone().into(), settings.clone().into()],
-                            iterations.unwrap_or([30, 70]),
-                            10_000.0,
+                            [
+                                settings.clone().into(),
+                                settings.clone().into(),
+                                settings.clone().into(),
+                            ],
+                            iterations.unwrap_or([30, 60, 10]),
+                            first_stage_res.unwrap_or(10_000.0),
                             observer,
                             false,
                             constraint,

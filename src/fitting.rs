@@ -287,6 +287,7 @@ struct CostFunction<'a, I: Interpolator, T: WavelengthDispersion, F: ContinuumFi
     target_dispersion: &'a T,
     observed_spectrum: &'a ObservedSpectrum,
     continuum_fitter: &'a F,
+    linear: bool,
     parallelize: bool,
 }
 
@@ -302,9 +303,13 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
         let logg = params[2];
         let vsini = params[3];
         let rv = params[4];
-        let synth_spec =
+        let synth_spec = if (self.linear) {
             self.interpolator
-                .produce_model(self.target_dispersion, teff, m, logg, vsini, rv)?;
+                .produce_model_linear(self.target_dispersion, teff, m, logg, vsini, rv)?
+        } else {
+            self.interpolator
+                .produce_model(self.target_dispersion, teff, m, logg, vsini, rv)?
+        };
         let (_, ls) = self
             .continuum_fitter
             .fit_continuum(self.observed_spectrum, &synth_spec)
@@ -384,23 +389,73 @@ where
     let solver = setup_pso(bounds.clone(), settings[0].clone(), None);
     let fitter =
         Executor::new(cost_functions.0, solver).configure(|state| state.max_iters(iterations[0]));
-    let result1 = fitter
+    let mut state1 = fitter
         .add_observer(observer.clone(), ObserverMode::Always)
         .run()
-        .with_context(|| "Error in first stage")?;
+        .with_context(|| "Error in first stage")?
+        .state;
+    state1.termination_status = argmin::core::TerminationStatus::NotTerminated;
 
     let solver = setup_pso(bounds, settings[1].clone(), None);
     // Inject the old populationstate into the new executor
-    let fitter = Executor::new(cost_functions.1, solver).configure(|_| {
-        let mut s = result1.state.max_iters(iterations[0] + iterations[1]);
-        s.termination_status = argmin::core::TerminationStatus::NotTerminated;
-        s
-    });
+    let fitter = Executor::new(cost_functions.1, solver)
+        .configure(|_| state1.max_iters(iterations[0] + iterations[1]));
 
     fitter
         .add_observer(observer, ObserverMode::Always)
         .run()
         .with_context(|| "Error in second stage")
+}
+
+fn pso_fit_three_stage<C1, C2, C3, B, const N: usize>(
+    settings: [PSOSettings; 3],
+    iterations: [u64; 3],
+    cost_functions: (C1, C2, C3),
+    bounds: B,
+    observer: Observer,
+) -> Result<
+    argmin::core::OptimizationResult<
+        C3,
+        particleswarm::ParticleSwarm<N, B, f64>,
+        PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
+    >,
+    argmin::core::Error,
+>
+where
+    C1: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
+    C2: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
+    C3: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
+    B: PSOBounds<N>,
+{
+    let solver = setup_pso(bounds.clone(), settings[0].clone(), None);
+    let fitter =
+        Executor::new(cost_functions.0, solver).configure(|state| state.max_iters(iterations[0]));
+    let mut state1 = fitter
+        .add_observer(observer.clone(), ObserverMode::Always)
+        .run()
+        .with_context(|| "Error in first stage")?
+        .state;
+    state1.termination_status = argmin::core::TerminationStatus::NotTerminated;
+
+    let solver = setup_pso(bounds.clone(), settings[1].clone(), None);
+    // Inject the old populationstate into the new executor
+    let fitter = Executor::new(cost_functions.1, solver)
+        .configure(|_| state1.max_iters(iterations[0] + iterations[1]));
+    let mut state2 = fitter
+        .add_observer(observer.clone(), ObserverMode::Always)
+        .run()
+        .with_context(|| "Error in second stage")?
+        .state;
+    state2.termination_status = argmin::core::TerminationStatus::NotTerminated;
+
+    let solver = setup_pso(bounds, settings[2].clone(), None);
+    // Inject the old populationstate into the new executor
+    let fitter = Executor::new(cost_functions.2, solver)
+        .configure(|_| state2.max_iters(iterations[0] + iterations[1] + iterations[2]));
+    fitter
+        .add_observer(observer, ObserverMode::Always)
+        .run()
+        .with_context(|| "Error in third stage")
 }
 
 fn get_best_param<const N: usize, C, B>(
@@ -475,6 +530,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             target_dispersion: &self.target_dispersion,
             observed_spectrum,
             continuum_fitter: &self.continuum_fitter,
+            linear: false,
             parallelize,
         };
         let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
@@ -523,12 +579,12 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         })
     }
 
-    pub fn fit_two_stage(
+    pub fn fit_three_stage(
         &self,
         interpolator: &impl Interpolator,
         observed_spectrum: &ObservedSpectrum,
-        settings: [PSOSettings; 2],
-        iterations: [u64; 2],
+        settings: [PSOSettings; 3],
+        iterations: [u64; 3],
         first_stage_res: f64,
         observer: Observer,
         parallelize: bool,
@@ -568,6 +624,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             target_dispersion: &disp_synth,
             observed_spectrum: &observed_convolved,
             continuum_fitter: &self.continuum_fitter,
+            linear: true,
             parallelize,
         };
         // Second stage
@@ -576,15 +633,27 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             target_dispersion: &self.target_dispersion,
             observed_spectrum,
             continuum_fitter: &self.continuum_fitter,
+            linear: true,
             parallelize,
         };
+        // Third stage
+        let cost_function3 = CostFunction {
+            interpolator,
+            target_dispersion: &self.target_dispersion,
+            observed_spectrum,
+            continuum_fitter: &self.continuum_fitter,
+            linear: false,
+            parallelize,
+        };
+
+
         let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
             .with_constraints(constraints);
 
-        let result = pso_fit_two_stage(
+        let result = pso_fit_three_stage(
             settings,
             iterations,
-            (cost_function1, cost_function2),
+            (cost_function1, cost_function2, cost_function3),
             bounds,
             observer,
         )?;
@@ -636,6 +705,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             target_dispersion: &self.target_dispersion,
             observed_spectrum,
             continuum_fitter: &self.continuum_fitter,
+            linear: false,
             parallelize: false,
         };
 

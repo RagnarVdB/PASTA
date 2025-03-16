@@ -783,6 +783,15 @@ pub trait Interpolator: Send + Sync {
         vsini: f64,
         rv: f64,
     ) -> Result<na::DVector<FluxFloat>>;
+    fn produce_model_linear(
+        &self,
+        target_dispersion: &impl WavelengthDispersion,
+        teff: f64,
+        m: f64,
+        logg: f64,
+        vsini: f64,
+        rv: f64,
+    ) -> Result<na::DVector<FluxFloat>>;
     fn produce_model_on_grid(
         &self,
         target_dispersion: &impl WavelengthDispersion,
@@ -1077,6 +1086,30 @@ impl<F: ModelFetcher> Interpolator for GridInterpolator<F> {
         let interpolated = self
             .interpolate(teff, m, logg)
             .with_context(|| format!("Error while interpolating at ({}, {}, {})", teff, m, logg))?;
+
+        let convolved_for_rotation = convolve_rotation(&self.synth_wl, &interpolated, vsini)
+            .with_context(|| format!("Error during rotational broadening, vsini={}", vsini))?;
+        let model = target_dispersion
+            .convolve_segment(convolved_for_rotation)
+            .context("Error during instrument resolution convolution")?;
+        let output = shift_and_resample(&self.synth_wl, &model, target_dispersion, rv)
+            .context("error during RV shifting / resampling")?;
+
+        Ok(output)
+    }
+
+    fn produce_model_linear(
+        &self,
+        target_dispersion: &impl WavelengthDispersion,
+        teff: f64,
+        m: f64,
+        logg: f64,
+        vsini: f64,
+        rv: f64,
+    ) -> Result<na::DVector<FluxFloat>> {
+        let interpolated = self
+            .interpolate_linear(teff, m, logg)
+            .with_context(|| format!("Error while interpolating linearly at ({}, {}, {})", teff, m, logg))?;
 
         let convolved_for_rotation = convolve_rotation(&self.synth_wl, &interpolated, vsini)
             .with_context(|| format!("Error during rotational broadening, vsini={}", vsini))?;
