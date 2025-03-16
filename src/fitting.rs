@@ -362,6 +362,73 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
     }
 }
 
+fn fit_two_stage<C1, C2, B, const N: usize>(
+    settings: [PSOSettings; 2],
+    iterations: [u64; 2],
+    cost_functions: (C1, C2),
+    bounds: B,
+    observer: Observer,
+) -> Result<
+    argmin::core::OptimizationResult<
+        C2,
+        particleswarm::ParticleSwarm<N, B, f64>,
+        PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
+    >,
+    argmin::core::Error,
+>
+where
+    C1: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
+    C2: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
+    B: PSOBounds<N>,
+{
+    let solver = setup_pso(bounds.clone(), settings[0].clone(), None);
+    let fitter =
+        Executor::new(cost_functions.0, solver).configure(|state| state.max_iters(iterations[0]));
+    let result1 = fitter
+        .add_observer(observer.clone(), ObserverMode::Always)
+        .run()?;
+
+    // Inject the old populationstate into the new executor
+    let solver = setup_pso(bounds, settings[1].clone(), None);
+    let fitter = Executor::new(cost_functions.1, solver)
+        .configure(|_| result1.state.max_iters(iterations[0] + iterations[1]));
+
+    fitter.add_observer(observer, ObserverMode::Always).run()
+}
+
+fn get_best_param<const N: usize, C, B>(
+    result: argmin::core::OptimizationResult<
+        C,
+        particleswarm::ParticleSwarm<N, B, f64>,
+        PopulationState<particleswarm::Particle<na::SVector<f64, N>, f64>, f64>,
+    >,
+) -> Result<na::SVector<f64, N>>
+where
+    C: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
+    B: PSOBounds<N>,
+{
+    let best_param = result
+        .state
+        .get_population()
+        .ok_or(anyhow!("No population"))?
+        .iter()
+        .min_by(|a, b| {
+            a.cost
+                .partial_cmp(&b.cost)
+                .ok_or(anyhow!(
+                    "Failed comparison {}, {}: {}, {}",
+                    a.cost,
+                    b.cost,
+                    a.position,
+                    b.position
+                ))
+                .unwrap()
+        })
+        .unwrap()
+        .position;
+    Ok(best_param)
+}
+
 pub struct SingleFitter<T: WavelengthDispersion, F: ContinuumFitter> {
     target_dispersion: T,
     continuum_fitter: F,
@@ -453,9 +520,9 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         &self,
         interpolator: &impl Interpolator,
         observed_spectrum: &ObservedSpectrum,
-        settings: PSOSettings,
+        settings: [PSOSettings; 2],
+        iterations: [u64; 2],
         first_stage_res: f64,
-        first_stage_settings: PSOSettings,
         observer: Observer,
         parallelize: bool,
         constraints: Vec<BoundsConstraint>,
@@ -489,30 +556,16 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             first_stage_res,
             &interpolator.synth_wl(),
         )?;
-        // let observed_convolved =
-        let cost_function = CostFunction {
+        // First stage
+        let cost_function1 = CostFunction {
             interpolator,
             target_dispersion: &disp_synth,
             observed_spectrum: &observed_convolved,
             continuum_fitter: &self.continuum_fitter,
             parallelize,
         };
-        let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
-            .with_constraints(constraints.clone());
-        let solver = setup_pso(bounds, first_stage_settings.clone(), None);
-        let fitter = Executor::new(cost_function, solver)
-            .configure(|state| state.max_iters(first_stage_settings.max_iters));
-        let result = fitter.run()?;
-        let positions = result
-            .state
-            .get_population()
-            .ok_or(anyhow!("No population first stage"))?
-            .iter()
-            .map(|p| p.position)
-            .collect::<Vec<_>>();
-
         // Second stage
-        let cost_function = CostFunction {
+        let cost_function2 = CostFunction {
             interpolator,
             target_dispersion: &self.target_dispersion,
             observed_spectrum,
@@ -521,40 +574,21 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         };
         let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
             .with_constraints(constraints);
-        // Take positions from part one as starting point
-        let solver = setup_pso(bounds, settings.clone(), Some(positions.clone()));
-        let fitter = Executor::new(cost_function, solver)
-            .configure(|state| state.max_iters(settings.max_iters));
-        let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
 
-        // let best_param = result
-        //     .state
-        //     .clone()
-        //     .best_individual
-        //     .ok_or(anyhow!("No best parameter found second stage: \n old: {:?}\n\n new: {:?}", positions, result.state.clone().get_population().unwrap().iter()
-        //     .map(|p| p.position)
-        //     .collect::<Vec<_>>()))?
-        //     .position;
-
-        let best_param = result
-            .state
-            .get_population()
-            .ok_or(anyhow!("No population second stage"))?
-            .iter()
-            .min_by(|a, b| {
-                a.cost
-                    .partial_cmp(&b.cost)
-                    .ok_or(anyhow!(
-                        "Failed comparison {}, {}: {}, {}",
-                        a.cost,
-                        b.cost,
-                        a.position,
-                        b.position
-                    ))
-                    .unwrap()
-            })
-            .unwrap()
-            .position;
+        let result = fit_two_stage(
+            settings,
+            iterations,
+            (cost_function1, cost_function2),
+            bounds,
+            observer,
+        )?;
+        let time = match result.state.time {
+            Some(t) => t.as_secs_f64(),
+            None => 0.0,
+        };
+        let iters = result.state.iter;
+        let chi2 = result.state.best_cost;
+        let best_param = get_best_param(result)?;
 
         let teff = best_param[0];
         let m = best_param[1];
@@ -567,10 +601,6 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         let (continuum_params, _) = self
             .continuum_fitter
             .fit_continuum(observed_spectrum, &synth_spec)?;
-        let time = match result.state.time {
-            Some(t) => t.as_secs_f64(),
-            None => 0.0,
-        };
         Ok(OptimizationResult {
             label: Label {
                 teff,
@@ -580,9 +610,9 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
                 rv,
             },
             continuum_params,
-            chi2: result.state.best_cost,
+            chi2,
             time,
-            iters: result.state.iter,
+            iters,
         })
     }
 

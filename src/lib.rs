@@ -1527,8 +1527,8 @@ macro_rules! implement_methods {
                 observed_flux: PyArrayLike<FluxFloat, Ix1>,
                 observed_var: PyArrayLike<FluxFloat, Ix1>,
                 settings: PSOSettings,
+                iterations: Option<[u64; 2]>,
                 first_stage_res: Option<f64>,
-                first_stage_iters: Option<u64>,
                 trace_directory: Option<String>,
                 best_particle_file: Option<String>,
                 parallelize: Option<bool>,
@@ -1545,30 +1545,19 @@ macro_rules! implement_methods {
                         .collect(),
                     None => vec![],
                 };
-                let result = if let Some(first_stage_iters) = first_stage_iters {
-                    let mut first_settings = settings.0.clone();
-                    first_settings.max_iters = first_stage_iters;
-                    self.0.fit_two_stage(
+                Ok(self
+                    .0
+                    .fit_two_stage(
                         &interpolator.0,
                         &observed_spectrum.into(),
-                        settings.into(),
+                        [settings.clone().into(), settings.into()],
+                        iterations.unwrap_or([30, 70]),
                         first_stage_res.unwrap_or(10_000.0),
-                        first_settings,
                         get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
                         parallelize.unwrap_or(true),
                         constraints,
                     )?
-                } else {
-                    self.0.fit(
-                        &interpolator.0,
-                        &observed_spectrum.into(),
-                        settings.into(),
-                        get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
-                        parallelize.unwrap_or(true),
-                        constraints,
-                    )?
-                };
-                Ok(result.into())
+                    .into())
             }
 
             /// Fit many observed spectra, multithreading over spectra instead of particles.
@@ -1579,7 +1568,7 @@ macro_rules! implement_methods {
                 observed_fluxes: Vec<Vec<FluxFloat>>,
                 observed_vars: Vec<Vec<FluxFloat>>,
                 settings: PSOSettings,
-                first_stage_iters: Option<u64>,
+                iterations: Option<[u64; 2]>,
                 constraints: Option<Vec<Vec<PyConstraintWrapper>>>,
                 best_particle_files: Option<Vec<String>>,
                 progress: Option<bool>,
@@ -1611,11 +1600,6 @@ macro_rules! implement_methods {
                         .collect(),
                     None => vec![Observer::DummyObserver; observed_fluxes.len()],
                 };
-                let first_settings = first_stage_iters.map(|i| {
-                    let mut first_settings = settings.0.clone();
-                    first_settings.max_iters = i;
-                    first_settings
-                });
                 Ok(observed_fluxes
                     .into_par_iter()
                     .zip(observed_vars)
@@ -1624,38 +1608,19 @@ macro_rules! implement_methods {
                     .enumerate()
                     .map(|(i, (((flux, var), constraint), observer))| {
                         let observed_spectrum = ObservedSpectrum::from_vecs(flux, var);
-                        let result = if let Some(first_settings) = first_settings.clone() {
-                            self.0.fit_two_stage(
-                                &interpolator.0,
-                                &observed_spectrum.into(),
-                                settings.clone().into(),
-                                10_000.0,
-                                first_settings,
-                                observer,
-                                false,
-                                constraint,
-                            )
-                        } else {
-                            self.0.fit(
-                                &interpolator.0,
-                                &observed_spectrum.into(),
-                                settings.clone().into(),
-                                observer,
-                                false,
-                                constraint,
-                            )
-                        };
+                        let result = self.0.fit_two_stage(
+                            &interpolator.0,
+                            &observed_spectrum.into(),
+                            [settings.clone().into(), settings.clone().into()],
+                            iterations.unwrap_or([30, 70]),
+                            10_000.0,
+                            observer,
+                            false,
+                            constraint,
+                        );
+
                         progress_bar.inc(1);
-                        // match result {
-                        //     Ok(result) => result,
-                        //     Err(err) => println!("Error for spectrum{}", )
-                        // }
-                        // if let Ok(result) = result {
-                        //     Some(result.into())
-                        // } else {
-                        //     println!("Error for spectrum {}", i);
-                        //     None
-                        // }
+
                         Some(
                             result
                                 .with_context(|| format!("Error for spectrum {}", i))
@@ -1747,7 +1712,7 @@ macro_rules! implement_methods {
                                 Ok(x) => x,
                                 Err(_) => f64::NAN,
                             },
-                            _ => chi.unwrap()
+                            _ => chi.unwrap(),
                         }
                     })
                     .collect())
