@@ -362,7 +362,7 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
     }
 }
 
-fn fit_two_stage<C1, C2, B, const N: usize>(
+fn pso_fit_two_stage<C1, C2, B, const N: usize>(
     settings: [PSOSettings; 2],
     iterations: [u64; 2],
     cost_functions: (C1, C2),
@@ -386,14 +386,21 @@ where
         Executor::new(cost_functions.0, solver).configure(|state| state.max_iters(iterations[0]));
     let result1 = fitter
         .add_observer(observer.clone(), ObserverMode::Always)
-        .run()?;
+        .run()
+        .with_context(|| "Error in first stage")?;
 
-    // Inject the old populationstate into the new executor
     let solver = setup_pso(bounds, settings[1].clone(), None);
-    let fitter = Executor::new(cost_functions.1, solver)
-        .configure(|_| result1.state.max_iters(iterations[0] + iterations[1]));
+    // Inject the old populationstate into the new executor
+    let fitter = Executor::new(cost_functions.1, solver).configure(|_| {
+        let mut s = result1.state.max_iters(iterations[0] + iterations[1]);
+        s.termination_status = argmin::core::TerminationStatus::NotTerminated;
+        s
+    });
 
-    fitter.add_observer(observer, ObserverMode::Always).run()
+    fitter
+        .add_observer(observer, ObserverMode::Always)
+        .run()
+        .with_context(|| "Error in second stage")
 }
 
 fn get_best_param<const N: usize, C, B>(
@@ -556,7 +563,6 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             first_stage_res,
             &interpolator.synth_wl(),
         )?;
-        // First stage
         let cost_function1 = CostFunction {
             interpolator,
             target_dispersion: &disp_synth,
@@ -575,7 +581,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
             .with_constraints(constraints);
 
-        let result = fit_two_stage(
+        let result = pso_fit_two_stage(
             settings,
             iterations,
             (cost_function1, cost_function2),
