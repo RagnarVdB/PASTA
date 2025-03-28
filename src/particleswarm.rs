@@ -34,21 +34,21 @@ use rand::{Rng, SeedableRng};
 #[derive(Clone)]
 pub struct ParticleSwarm<const N: usize, B: PSOBounds<N>, F> {
     /// Inertia weight
-    weight_inertia: F,
+    pub weight_inertia: F,
     /// Cognitive acceleration coefficient
-    weight_cognitive: F,
+    pub weight_cognitive: F,
     /// Social acceleration coefficient
-    weight_social: F,
+    pub weight_social: F,
     /// Delta (potential)
-    delta: na::SVector<F, N>,
+    pub delta: na::SVector<F, N>,
     /// Bounds on parameter space
-    bounds: B,
+    pub bounds: B,
     /// Number of particles
-    num_particles: usize,
+    pub num_particles: usize,
     /// Random number generator
-    rng_generator: rand::rngs::StdRng,
+    pub rng_generator: rand::rngs::StdRng,
     /// Initial positions, random if set to None
-    initial_positions: Option<Vec<na::SVector<f64, N>>>,
+    pub initial_positions: Option<Vec<na::SVector<f64, N>>>,
 }
 
 impl<const N: usize, B, F> ParticleSwarm<N, B, F>
@@ -351,13 +351,13 @@ pub struct Particle<T, F> {
     /// Position of particle
     pub position: T,
     /// Velocity of particle
-    velocity: T,
+    pub velocity: T,
     /// Cost of particle
     pub cost: F,
     /// Best position of particle so far
-    best_position: T,
+    pub best_position: T,
     /// Best cost of particle so far
-    best_cost: F,
+    pub best_cost: F,
 }
 
 impl<T, F> Particle<T, F>

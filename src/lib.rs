@@ -57,7 +57,7 @@ impl PSOSettings {
     #[new]
     pub fn new(
         num_particles: usize,
-        max_iters: u64,
+        max_iters: Option<u64>,
         inertia_factor: Option<f64>,
         cognitive_factor: Option<f64>,
         social_factor: Option<f64>,
@@ -65,7 +65,7 @@ impl PSOSettings {
     ) -> Self {
         PSOSettings(fitting::PSOSettings {
             num_particles,
-            max_iters,
+            max_iters: max_iters.unwrap_or(100),
             inertia_factor: inertia_factor.unwrap_or(0.7213475204),
             cognitive_factor: cognitive_factor.unwrap_or(1.1931471806),
             social_factor: social_factor.unwrap_or(1.1931471806),
@@ -1561,6 +1561,14 @@ macro_rules! implement_methods {
                         parallelize.unwrap_or(true),
                         constraints,
                     )?
+                    // .fit(
+                    //     &interpolator.0,
+                    //     &observed_spectrum.into(),
+                    //     settings.into(),
+                    //     get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
+                    //     parallelize.unwrap_or(true),
+                    //     constraints,
+                    // )?
                     .into())
             }
 

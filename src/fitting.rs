@@ -14,9 +14,11 @@ use argmin::core::{CostFunction as _, Executor, PopulationState, State, KV};
 use argmin::solver::brent::BrentRoot;
 use itertools::Itertools;
 use nalgebra::{self as na};
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
+use std::iter::once;
 use std::path::PathBuf;
 
 /// Observed specrum with flux and variance
@@ -179,6 +181,12 @@ pub struct ParticleInfo {
     pub cost: f64,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct IterationInfo {
+    particles: Vec<ParticleInfo>,
+    best_particle: ParticleInfo,
+}
+
 #[derive(Clone)]
 pub enum Observer {
     DummyObserver,
@@ -236,13 +244,21 @@ impl<const N: usize>
                 let particles = state
                     .get_population()
                     .ok_or(argmin::core::Error::msg("No particles"))?;
-                let values = particles
+                let particle_infos = particles
                     .iter()
                     .map(|p| ParticleInfo {
                         position: p.position.data.as_slice().to_owned(),
                         cost: p.cost,
                     })
                     .collect::<Vec<_>>();
+                let p = state.individual.clone().unwrap();
+                let values = IterationInfo {
+                    particles: particle_infos,
+                    best_particle: ParticleInfo {
+                        position: p.position.data.as_slice().to_owned(),
+                        cost: p.cost,
+                    },
+                };
                 let filename = dir.join(format!("{}_{}.json", file_prefix, iter));
                 let f = BufWriter::new(File::create(filename)?);
                 serde_json::to_writer(f, &values)?;
@@ -256,6 +272,7 @@ impl<const N: usize>
                 let best_particle = state
                     .get_best_param()
                     .ok_or(argmin::core::Error::msg("No best particle"))?;
+                // println!("Iter: {}, {}", iter, best_particle.cost);
                 let particle_info = ParticleInfo {
                     position: best_particle.position.data.as_slice().to_owned(),
                     cost: best_particle.cost,
@@ -265,7 +282,7 @@ impl<const N: usize>
                     let reader = BufReader::new(file);
                     serde_json::from_reader(reader)?
                 } else {
-                    let file = File::create(&filename)?;
+                    File::create(&filename)?;
                     Vec::new()
                 };
                 if particles.len() <= iter {
@@ -282,6 +299,7 @@ impl<const N: usize>
 }
 
 /// Cost function used in the PSO fitting
+#[derive(Clone)]
 struct CostFunction<'a, I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> {
     interpolator: &'a I,
     target_dispersion: &'a T,
@@ -303,9 +321,15 @@ impl<I: Interpolator, T: WavelengthDispersion, F: ContinuumFitter> argmin::core:
         let logg = params[2];
         let vsini = params[3];
         let rv = params[4];
-        let synth_spec = if (self.linear) {
-            self.interpolator
-                .produce_model_linear(self.target_dispersion, teff, m, logg, vsini, rv)?
+        let synth_spec = if self.linear {
+            self.interpolator.produce_model_linear(
+                self.target_dispersion,
+                teff,
+                m,
+                logg,
+                vsini,
+                rv,
+            )?
         } else {
             self.interpolator
                 .produce_model(self.target_dispersion, teff, m, logg, vsini, rv)?
@@ -422,35 +446,83 @@ fn pso_fit_three_stage<C1, C2, C3, B, const N: usize>(
     argmin::core::Error,
 >
 where
-    C1: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
-    C2: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
-    C3: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync,
+    C1: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync + Clone,
+    C2: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync + Clone,
+    C3: argmin::core::CostFunction<Param = na::SVector<f64, N>, Output = f64> + Send + Sync + Clone,
     B: PSOBounds<N>,
 {
+    let (c1, c2, c3) = cost_functions;
+    let mut rng_generator = rand::rngs::StdRng::from_entropy();
     let solver = setup_pso(bounds.clone(), settings[0].clone(), None);
-    let fitter =
-        Executor::new(cost_functions.0, solver).configure(|state| state.max_iters(iterations[0]));
+    let fitter = Executor::new(c1, solver).configure(|state| state.max_iters(iterations[0]));
     let mut state1 = fitter
         .add_observer(observer.clone(), ObserverMode::Always)
         .run()
         .with_context(|| "Error in first stage")?
         .state;
-    state1.termination_status = argmin::core::TerminationStatus::NotTerminated;
 
+    // Part two
     let solver = setup_pso(bounds.clone(), settings[1].clone(), None);
+    let num_particles = solver.num_particles;
     // Inject the old populationstate into the new executor
-    let fitter = Executor::new(cost_functions.1, solver)
+    let best_position = state1.best_individual.clone().unwrap().position;
+    let new_best_cost = c2.cost(&best_position)?;
+    let random_positions = bounds
+        .clone()
+        .clone()
+        .generate_random_within_bounds(&mut rng_generator, num_particles - 1)
+        .into_iter()
+        .collect::<Vec<_>>();
+    state1
+        .population
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(once(best_position).chain(random_positions))
+        .for_each(|(p, pos)| {
+            p.position = pos;
+            p.cost = c2.cost(&pos).unwrap();
+            p.best_cost = c2.cost(&p.best_position).unwrap();
+        });
+    state1.best_individual = Some(state1.population.as_ref().unwrap()[0].clone());
+    state1.individual = Some(state1.population.as_ref().unwrap()[0].clone());
+    state1.cost = new_best_cost;
+    state1.best_cost = new_best_cost;
+    state1.termination_status = argmin::core::TerminationStatus::NotTerminated;
+    let fitter = Executor::new(c2.clone(), solver)
         .configure(|_| state1.max_iters(iterations[0] + iterations[1]));
     let mut state2 = fitter
         .add_observer(observer.clone(), ObserverMode::Always)
         .run()
         .with_context(|| "Error in second stage")?
         .state;
-    state2.termination_status = argmin::core::TerminationStatus::NotTerminated;
 
-    let solver = setup_pso(bounds, settings[2].clone(), None);
-    // Inject the old populationstate into the new executor
-    let fitter = Executor::new(cost_functions.2, solver)
+    // Part three
+    let solver = setup_pso(bounds.clone(), settings[2].clone(), None);
+    let best_position = state2.best_individual.clone().unwrap().position;
+    let new_best_cost = c3.cost(&best_position)?;
+    let random_positions = bounds
+        .clone()
+        .generate_random_within_bounds(&mut rng_generator, num_particles - 1)
+        .into_iter()
+        .collect::<Vec<_>>();
+    state2
+        .population
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(once(best_position).chain(random_positions))
+        .for_each(|(p, pos)| {
+            p.position = pos;
+            p.cost = c3.cost(&pos).unwrap();
+            p.best_cost = c3.cost(&p.best_position).unwrap();
+        });
+    state2.best_individual = Some(state2.population.as_ref().unwrap()[0].clone());
+    state2.individual = Some(state2.population.as_ref().unwrap()[0].clone());
+    state2.cost = new_best_cost;
+    state2.best_cost = new_best_cost;
+    state2.termination_status = argmin::core::TerminationStatus::NotTerminated;
+    let fitter = Executor::new(c3, solver)
         .configure(|_| state2.max_iters(iterations[0] + iterations[1] + iterations[2]));
     fitter
         .add_observer(observer, ObserverMode::Always)
@@ -581,7 +653,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
 
     pub fn fit_three_stage(
         &self,
-        interpolator: &impl Interpolator,
+        interpolator: &(impl Interpolator + Clone),
         observed_spectrum: &ObservedSpectrum,
         settings: [PSOSettings; 3],
         iterations: [u64; 3],
@@ -645,7 +717,6 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             linear: false,
             parallelize,
         };
-
 
         let bounds = SingleBounds::new(interpolator.grid_bounds(), self.vsini_range, self.rv_range)
             .with_constraints(constraints);
