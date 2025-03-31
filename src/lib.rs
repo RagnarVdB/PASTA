@@ -1585,6 +1585,7 @@ macro_rules! implement_methods {
                 constraints: Option<Vec<Vec<PyConstraintWrapper>>>,
                 best_particle_files: Option<Vec<String>>,
                 progress: Option<bool>,
+                allow_none: Option<bool>,
             ) -> PyResult<Vec<Option<OptimizationResult>>> {
                 let progress_bar = if progress.unwrap_or(false) {
                     ProgressBar::new(observed_fluxes.len() as u64)
@@ -1637,13 +1638,16 @@ macro_rules! implement_methods {
                         );
 
                         progress_bar.inc(1);
-
-                        Some(
-                            result
-                                .with_context(|| format!("Error for spectrum {}", i))
-                                .unwrap()
-                                .into(),
-                        )
+                        if allow_none.unwrap_or(false) {
+                            result.ok().map(|x| x.into())
+                        } else {
+                            Some(
+                                result
+                                    .with_context(|| format!("Error for spectrum {}", i))
+                                    .unwrap()
+                                    .into(),
+                            )
+                        }
                     })
                     .collect::<Vec<_>>())
             }
