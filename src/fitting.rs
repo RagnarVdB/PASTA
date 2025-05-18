@@ -590,6 +590,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
         interpolator: &impl Interpolator,
         observed_spectrum: &ObservedSpectrum,
         settings: PSOSettings,
+        iterations: u64,
         observer: Observer,
         parallelize: bool,
         constraints: Vec<BoundsConstraint>,
@@ -609,7 +610,7 @@ impl<T: WavelengthDispersion, F: ContinuumFitter> SingleFitter<T, F> {
             .with_constraints(constraints);
         let solver = setup_pso(bounds, settings.clone(), None);
         let fitter = Executor::new(cost_function, solver)
-            .configure(|state| state.max_iters(settings.max_iters));
+            .configure(|state| state.max_iters(iterations));
         let result = fitter.add_observer(observer, ObserverMode::Always).run()?;
 
         let best_param = result

@@ -1521,6 +1521,42 @@ macro_rules! implement_methods {
             /// Fit an observed spectrum of a single star with the PSO algorithm.
             /// trace_directory is optional. If specified, the traces of the optimization process will be saved there.
             /// If `parallelize` is true, the optimization will be parallelized over particles.
+            pub fn fit_single_stage(
+                &self,
+                interpolator: &$name,
+                observed_flux: PyArrayLike<FluxFloat, Ix1>,
+                observed_var: PyArrayLike<FluxFloat, Ix1>,
+                settings: PSOSettings,
+                iterations: Option<u64>,
+                trace_directory: Option<String>,
+                best_particle_file: Option<String>,
+                parallelize: Option<bool>,
+                constraints: Option<Vec<PyConstraintWrapper>>,
+            ) -> PyResult<OptimizationResult> {
+                let observed_spectrum = ObservedSpectrum {
+                    flux: observed_flux.as_matrix().column(0).into_owned(),
+                    var: observed_var.as_matrix().column(0).into_owned(),
+                };
+                let constraints = match constraints {
+                    Some(constraints) => constraints
+                        .into_iter()
+                        .map(|constraint| constraint.0)
+                        .collect(),
+                    None => vec![],
+                };
+                Ok(self
+                    .0
+                    .fit(
+                        &interpolator.0,
+                        &observed_spectrum.into(),
+                        settings.into(),
+                        iterations.unwrap_or(100),
+                        get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
+                        parallelize.unwrap_or(true),
+                        constraints,
+                    )?
+                    .into())
+            }
             pub fn fit(
                 &self,
                 interpolator: &$name,
@@ -1561,14 +1597,6 @@ macro_rules! implement_methods {
                         parallelize.unwrap_or(true),
                         constraints,
                     )?
-                    // .fit(
-                    //     &interpolator.0,
-                    //     &observed_spectrum.into(),
-                    //     settings.into(),
-                    //     get_observer_and_init::<5>(trace_directory, best_particle_file, false).0,
-                    //     parallelize.unwrap_or(true),
-                    //     constraints,
-                    // )?
                     .into())
             }
 
