@@ -151,7 +151,6 @@ get_fitter(
     self,
     dispersion: PyWavelengthDispersion,
     continuum_fitter: PyContinuumFitter,
-    settings: PSOSettings,
     vsini_range: (float, float),
     rv_range: (float, float),
 ) -> PySingleFitter
@@ -168,8 +167,6 @@ This does come at a computational cost.
 
 The second argument specifies the function that will be fitted against the pseudo continuum before $\chi^2$ is evaluated.
 Currently three classes for this are provided. [ChunkContinuumFitter](#chunkcontinuumfitter) divides the spectrum in a specified number of chunks, fits every chunk by a polynomial of specified degree, and blends them together. This method is generally recommended. [LinearModelContinuumFitter](#linearmodelcontinuumfitter) allows using any linear model by supplying a design matrix. [FixedContinuum](#fixedcontinuum) and [ConstantContinuum](#constantcontinuum) turn off continuum fitting and use a user specified pseudo continuum or an array of ones respectively.
-
-The third argument specifies the metaparameters to the particle swarm optimization. See [PSOSettings](#psosettings).
 
 
 #### produce_model
@@ -203,6 +200,30 @@ fit_continuum_and_return_model(
 This class handles fitting observed spectra of single stars, as well as computing uncertainties and sampling the $\chi^2$ landscape. It can be constructed by calling [`get_fitter`](#get_fitter) on an `Interpolator` object.
 Its methods are:
 
+#### fit_single_stage
+```python
+fit_single_stage(
+    self,
+    interpolator: Interpolator,
+    observed_flux: np.ndarray[np.float32],
+    observed_var: np.ndarray[np.float32],
+    settings: PSOSettings,
+    iterations=100: int,
+    trace_directory=None: str | None,
+    best_particle_file=None: str | None
+    parallelize=True: bool,
+    constraints=[]: List[Constraint] | []
+) -> OptimizationResult
+```
+
+This is the method for fitting an observed spectrum through particle swarm optimization.
+The first argument requires a reference to an interpolator object to handle the model generation.
+The second and third arguments demand the flux and variance values of the observed spectrum. The lengths of these arrays must match with the wavelength array that was provided through the dispersion argument when constructing the fitter object.
+The fourth and fifth arguments are optional and are used to save the particle positions throughout the optimization run. That data will be stored in json files in the specified directory.
+The sixth argument specifies whether to speed up computations by multithreading over particles, i.e. let every particle be processed by its own thread.
+The last argument can be used to constrain the search domain in one or more parameter to a specified range or a fixed value.
+
+The function returns a [PyOptimizationResult](#optimizationresult) object that includes all the solved labels, continuum function parameters and other info. This data can be easily obtained using the `to_dict()` or `to_json()` method.
 
 #### fit
 ```python
@@ -211,41 +232,62 @@ fit(
     interpolator: Interpolator,
     observed_flux: np.ndarray[np.float32],
     observed_var: np.ndarray[np.float32],
+    settings: PSOSettings,
+    iterations=[30, 60, 10]: List[int],
+    first_stage_res=10000: float,
     trace_directory=None: str | None,
+    best_particle_file=None: str | None
     parallelize=True: bool,
+    constraints=[]: List[Constraint] | []
 ) -> OptimizationResult
 ```
-
-This is the method for fitting an observed spectrum through particle swarm optimization.
-The first argument requires a reference to an interpolator object to handle the model generation.
-The second and third arguments demand the flux and variance values of the observed spectrum. The lengths of these arrays must match with the wavelength array that was provided through the dispersion argument when constructing the fitter object.
-The fourth argument is optional and is used to save the particle positions throughout the optimization run.
-That data will be stored in json files in the specified directory.
-Finally, the last argument specifies whether to speed up computations by multithreading over particles, i.e. let every particle be processed by its own thread.
-
-The function returns a [PyOptimizationResult](#optimizationresult) object that includes all the solved labels, continuum function parameters and other info. This data can be easily obtained using the `to_dict()` or `to_json()` method.
+Same as `fit_single_stage`, but using a three stage fitting algorithm. During the first stage both observed and model spectra are convolved to lower resolution (set by first_stage_res) to make finding the correct RV easier. During the second (and first) stage, linear interpolation is used to produce the model spectra, while in the third stage a more accurate but slower cubic interpolation is used.
 
 
-#### uncertainty_chi2
+#### fit_bulk
 ```python
-uncertainty_chi2(
+fit(
     self,
+    interpolator: Interpolator,
+    observed_fluxes: List[np.ndarray[np.float32]],
+    observed_vars: List[np.ndarray[np.float32]],
+    settings: PSOSettings,
+    iterations=[30, 60, 10]: List[int],
+    first_stage_res=10000: float,
+    constraints=[]: List[Constraint] | []
+    best_particle_file=None: str | None
+    progress=False: bool,
+    allow_none=False: bool
+) -> List[OptimizationResult]
+```
+
+Fit many spectra, parallelizing over spectra instead of particles. `If allow_none=True`, the function will not throw an exception when one of the optimizations fails, but instead return None for that spectrum. 
+
+#### compute_uncertainty
+```python
+compute_uncertainty(
+    self,
+    interpolator: Interpolator,
     observed_flux: list[float],
     observed_var: list[float],
     spec_res: float,
-    parameters: list[float; 5],
+    label: list[float; 5],
     search_radius=[2000.0, 0.3, 0.3, 40.0, 40.0]: list[float; 5],
 ) -> list[(float | None, float | None); 5]
 ```
+
+Compute uncertainty margins for all parameters, after an optimal solution has been found (passed through `label`). `spec_res` should be set to the spectral resolution of the instrument used.
 
 #### chi2
 ```python
 chi2(
     self,
+    interpolator: Interpolator,
     observed_flux: list[float],
     observed_var: list[float],
     labels: list[float; 5],
     allow_nan=False: bool,
+    progress=False: bool
 ) -> list[float]
 ```
 
@@ -273,6 +315,14 @@ The last argument specifies the wavelength grid of the models that the class wil
 
 
 ### [VariableResolutionDispersion](https://simonvanschuylenbergh.github.io/PASTA/pasta/fn.VariableResolutionDispersion.html)
+```python
+FixedResolutionDispersion(
+    wl: list[float],
+    disp: List[float],
+    synth_wl: WlGrid,
+)
+```
+disp: per pixel spectral resolution in Angstrom (FWHM)
 
 ### [NoConvolutionDispersion](https://simonvanschuylenbergh.github.io/PASTA/pasta/fn.NoConvolutionDispersion.html)
 This dispersion class is used when the models have already been convolved to the instrument resolution.
@@ -283,11 +333,24 @@ NoConvolutionDispersion(wl: list[float], synth_wl: WlGrid)
 ```
 
 ### [ChunkContinuumFitter](https://simonvanschuylenbergh.github.io/PASTA/pasta/fn.ChunkContinuumFitter.html)
-
+```python
+ChunkContinuumFitter(
+    wl: list[float],
+    n_chunks=5: int
+    p_order=8: int,
+    overlap=0.2: float,
+)
+```
 
 ### [LinearModelContinuumFitter](https://simonvanschuylenbergh.github.io/PASTA/pasta/fn.LinearModelContinuumFitter.html)
 
 ### [FixedContinuum](https://simonvanschuylenbergh.github.io/PASTA/pasta/fn.FixedContinuum.html)
+```python
+ChunkContinuumFitter(
+    continuum: List[float],
+    ignore_first_and_last=0: int
+)
+```
 
 ### [ConstantContinuum](https://simonvanschuylenbergh.github.io/PASTA/pasta/fn.ConstantContinuum.html)
 
